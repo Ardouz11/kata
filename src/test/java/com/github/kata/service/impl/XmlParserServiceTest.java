@@ -44,6 +44,8 @@ class XmlParserServiceTest {
     // When
     try {
       xmlParserService.parseFile(emptyFile);
+    } catch (RuntimeException e) {
+      assertEquals("File is empty", e.getMessage());
     } finally {
       emptyFile.delete();
     }
@@ -61,7 +63,7 @@ class XmlParserServiceTest {
     try {
       xmlParserService.parseFile(invalidFile);
     } catch (RuntimeException e) {
-      assertEquals("Error processing XML file", e.getMessage());
+      assertEquals("Error processing XML file: invalid-ledgers.xml", e.getMessage());
       assertTrue(e.getCause() instanceof JAXBException);
     }
     // Then

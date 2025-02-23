@@ -8,9 +8,9 @@ import com.github.kata.service.ParserService;
 import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.JAXBException;
 import jakarta.xml.bind.Unmarshaller;
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.util.ArrayList;
 import java.util.List;
 import javax.xml.stream.XMLInputFactory;
@@ -24,6 +24,21 @@ import org.springframework.stereotype.Service;
 public class XmlParserService implements ParserService {
   private static final Logger log = LoggerFactory.getLogger(XmlParserService.class);
   private static final int BATCH_SIZE = 1000;
+  private static final JAXBContext jaxbContext;
+  private static final XMLInputFactory xmlInputFactory;
+
+  static {
+    try {
+      jaxbContext = JAXBContext.newInstance(WsGeneralLedgerListWrapper.class);
+      xmlInputFactory = XMLInputFactory.newInstance();
+      // Security settings
+      xmlInputFactory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
+      xmlInputFactory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
+    } catch (JAXBException e) {
+      throw new ExceptionInInitializerError("Failed to initialize JAXBContext: " + e.getMessage());
+    }
+  }
+
   private final GeneralLedgerService generalLedgerService;
 
   XmlParserService(GeneralLedgerService generalLedgerService) {
@@ -50,50 +65,93 @@ public class XmlParserService implements ParserService {
    * @throws RuntimeException If an error occurs while processing the file, such as issues with XML
    *     unmarshalling, file not found, or errors during the batch processing.
    */
-  @Override
   public void parseFile(File file) {
-    try {
-      if (file.length() == 0) {
-        log.warn("The file is empty.");
-        return;
-      }
-      XMLInputFactory factory = XMLInputFactory.newInstance();
-      XMLStreamReader reader = factory.createXMLStreamReader(new FileInputStream(file));
+    validateFile(file);
 
-      JAXBContext context = JAXBContext.newInstance(WsGeneralLedgerListWrapper.class);
-      Unmarshaller unmarshaller = context.createUnmarshaller();
+    XMLStreamReader reader = null;
+    try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file))) {
+      reader = xmlInputFactory.createXMLStreamReader(bis);
 
-      WsGeneralLedgerListWrapper wrapper =
-          (WsGeneralLedgerListWrapper) unmarshaller.unmarshal(reader);
+      WsGeneralLedgerListWrapper wrapper = unmarshalXml(reader);
+      processResponse(wrapper.getResponse());
+      processLedgersInBatches(wrapper.getData().getLedgers());
 
-      // Process response data
-      Response response = wrapper.getResponse();
-      log.info("Processing file with result: {}", response.getResult());
-      log.info("Processing datetime: {}", response.getDatetime());
-
-      // Process ledgers in batches
-      List<WsGeneralLedger> ledgers = wrapper.getData().getLedgers();
-      List<WsGeneralLedger> batch = new ArrayList<>(BATCH_SIZE);
-
-      for (WsGeneralLedger ledger : ledgers) {
-        batch.add(ledger);
-
-        if (batch.size() >= BATCH_SIZE) {
-          generalLedgerService.processBatch(batch);
-          batch.clear();
-        }
-      }
-
-      if (!batch.isEmpty()) {
-        generalLedgerService.processBatch(batch);
-      }
-
-      reader.close();
       log.info("File processing completed successfully");
 
-    } catch (XMLStreamException | JAXBException | FileNotFoundException e) {
-      log.error("Error processing XML file", e);
-      throw new RuntimeException("Error processing XML file", e);
+    } catch (Exception e) {
+      log.error("Error processing XML file: {}", file.getName(), e);
+      throw new RuntimeException("Error processing XML file: " + file.getName(), e);
+    } finally {
+      if (reader != null) {
+        try {
+          reader.close();
+        } catch (XMLStreamException e) {
+          log.warn("Error closing XMLStreamReader", e);
+        }
+      }
+    }
+  }
+
+  private void validateFile(File file) {
+    if (file == null || !file.exists()) {
+      throw new IllegalArgumentException("File does not exist");
+    }
+    if (!file.canRead()) {
+      throw new IllegalArgumentException("File is not readable");
+    }
+    if (file.length() == 0) {
+      throw new IllegalArgumentException("File is empty");
+    }
+  }
+
+  private WsGeneralLedgerListWrapper unmarshalXml(XMLStreamReader reader) throws JAXBException {
+    Unmarshaller unmarshaller = jaxbContext.createUnmarshaller();
+    return (WsGeneralLedgerListWrapper) unmarshaller.unmarshal(reader);
+  }
+
+  private void processResponse(Response response) {
+    if (response == null) {
+      log.warn("Null response received");
+      return;
+    }
+    log.info("Processing file with result: {}", response.getResult());
+    log.info("Processing datetime: {}", response.getDatetime());
+  }
+
+  private void processLedgersInBatches(List<WsGeneralLedger> ledgers) {
+    if (ledgers == null || ledgers.isEmpty()) {
+      log.warn("No ledgers to process");
+      return;
+    }
+
+    int totalBatches = (ledgers.size() + BATCH_SIZE - 1) / BATCH_SIZE;
+    int processedLedgers = 0;
+
+    List<WsGeneralLedger> batch = new ArrayList<>(BATCH_SIZE);
+
+    for (WsGeneralLedger ledger : ledgers) {
+      batch.add(ledger);
+
+      if (batch.size() >= BATCH_SIZE) {
+        generalLedgerService.processBatch(batch);
+        processedLedgers += batch.size();
+        log.debug(
+            "Processed batch {}/{} ({} ledgers)",
+            processedLedgers / BATCH_SIZE,
+            totalBatches,
+            processedLedgers);
+        batch.clear();
+      }
+    }
+
+    if (!batch.isEmpty()) {
+      generalLedgerService.processBatch(batch);
+      processedLedgers += batch.size();
+      log.debug(
+          "Processed final batch {}/{} (total {} ledgers)",
+          totalBatches,
+          totalBatches,
+          processedLedgers);
     }
   }
 }
